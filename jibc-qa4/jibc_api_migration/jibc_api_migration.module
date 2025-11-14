@@ -1,0 +1,335 @@
+<?php
+
+use Drupal\field_collection\Entity\FieldCollectionItem;
+use Drupal\node\Entity\Node;
+use Drupal\migrate_tools\MigrateExecutable;
+use Drupal\migrate\MigrateMessage;
+use Drupal\migrate\Plugin\MigrationInterface;
+use Drupal\Core\Site\Settings;
+
+/**
+ * Implements hook_migration_plugins_alter().
+ *
+ * Dynamically set the API URLs based on environment configuration.
+ */
+function jibc_api_migration_migration_plugins_alter(array &$migrations) {
+  // Get API configuration from settings.php
+  $settings_config = Settings::get('jibc_api', []);
+  $base_url = $settings_config['api_base_url'] ?? 'https://apim.workato.com/jibc/coursefetch-v1-1';
+
+  // Update the new_courses migration with the correct URL
+  if (isset($migrations['new_courses'])) {
+    $migrations['new_courses']['source']['urls'] = $base_url . '/courses';
+  }
+}
+
+/**
+ * Implements hook_cron().
+ * 
+ * Main sync function - ensures Drupal reflects what's in the API
+ */
+function jibc_api_migration_cron() {
+  // Check frequency setting
+  $config = \Drupal::config('jibc_api_migration.settings');
+  $frequency = $config->get('jibc_api_migration_refresh_frequency') ?: 21600;
+  
+  // Check last run time
+  $state = \Drupal::state();
+  $last_run = $state->get('jibc_api_migration.last_cron_run', 0);
+  
+  if ((time() - $last_run) < $frequency) {
+    return;
+  }
+  
+  // Add a lock to prevent overlapping cron runs
+  $lock = \Drupal::lock();
+  if (!$lock->acquire('jibc_api_migration_cron', 300)) {
+    \Drupal::logger('jibc_api_migration')->warning('Skipping course migration - another instance is already running');
+    return;
+  }
+
+  try {
+    // Update last run time
+    $state->set('jibc_api_migration.last_cron_run', time());
+    
+    \Drupal::logger('jibc_api_migration')->notice('Starting course sync with API');
+    
+    // Get what's in the API
+    $api_courses = jibc_api_migration_get_api_courses();
+    
+    if (empty($api_courses)) {
+      \Drupal::logger('jibc_api_migration')->error('API returned no courses or failed - aborting sync');
+      return;
+    }
+    
+    $api_course_ids = array_keys($api_courses);
+    \Drupal::logger('jibc_api_migration')->info('API has @count courses', ['@count' => count($api_course_ids)]);
+    
+    // Step 1: Republish any archived courses that are back in API
+    $republished_count = jibc_api_migration_republish_courses($api_course_ids);
+    
+    // Step 2: Run the import migration to create/update courses
+    $migration = \Drupal::service('plugin.manager.migration')->createInstance('new_courses');
+    
+    if ($migration->getStatus() !== MigrationInterface::STATUS_IDLE) {
+      $migration->setStatus(MigrationInterface::STATUS_IDLE);
+    }
+
+    $executable = new \Drupal\jibc_api_migration\JIBCMigrateExecutable($migration, new MigrateMessage(), []);
+    $result = $executable->import();
+    
+    // Step 3: Archive/unpublish courses that are NOT in the API
+    $tempstore = \Drupal::service('tempstore.private')->get('jibc_api_migration');
+    $tempstore->set('unpublished', 0);
+    $rollback_result = $executable->rollbackMissingItems();
+    $unpublished_count = $tempstore->get('unpublished') ?: 0;
+    
+    // Step 4: Send notification email
+    jibc_api_migration_send_notification($republished_count, $unpublished_count);
+    
+    \Drupal::logger('jibc_api_migration')->notice('Course sync completed. Republished: @rep, Unpublished: @unp', [
+      '@rep' => $republished_count,
+      '@unp' => $unpublished_count,
+    ]);
+    
+  }
+  catch (\Exception $e) {
+    \Drupal::logger('jibc_api_migration')->error('Error during course sync: @message', [
+      '@message' => $e->getMessage(),
+    ]);
+  }
+  finally {
+    $lock->release('jibc_api_migration_cron');
+  }
+}
+
+/**
+ * Get all courses from the API
+ * 
+ * @return array
+ *   Associative array keyed by Course_ID
+ */
+function jibc_api_migration_get_api_courses() {
+  $settings_config = Settings::get('jibc_api', []);
+  
+  try {
+    $client = \Drupal::httpClient();
+    $api_url = rtrim($settings_config['api_base_url'], '/') . '/courses';
+    
+    $response = $client->get($api_url, [
+      'headers' => [
+        'api-token' => $settings_config['workato_auth_token'],
+        'Accept' => 'application/json',
+      ],
+      'timeout' => 30,
+      'http_errors' => FALSE,
+    ]);
+    
+    if ($response->getStatusCode() >= 400) {
+      \Drupal::logger('jibc_api_migration')->error('API returned error status @code', [
+        '@code' => $response->getStatusCode()
+      ]);
+      return [];
+    }
+    
+    $data = json_decode($response->getBody(), TRUE);
+    
+    if (!isset($data['array']) || !is_array($data['array'])) {
+      \Drupal::logger('jibc_api_migration')->error('Invalid API response structure');
+      return [];
+    }
+    
+    // Safety check - if API returns suspiciously few courses, abort
+    if (count($data['array']) < 100) {
+      \Drupal::logger('jibc_api_migration')->error('API returned only @count courses - possible API issue', [
+        '@count' => count($data['array'])
+      ]);
+      return [];
+    }
+    
+    // Convert to associative array keyed by Course_ID
+    $courses = [];
+    foreach ($data['array'] as $course) {
+      if (!empty($course['Course_ID'])) {
+        $courses[$course['Course_ID']] = $course;
+      }
+    }
+    
+    return $courses;
+    
+  } catch (\Exception $e) {
+    \Drupal::logger('jibc_api_migration')->error('Failed to fetch API courses: @error', [
+      '@error' => $e->getMessage()
+    ]);
+    return [];
+  }
+}
+
+/**
+ * Republish archived courses that exist in the API
+ * 
+ * @param array $api_course_ids
+ *   Array of course IDs from the API
+ * 
+ * @return int
+ *   Number of courses republished
+ */
+function jibc_api_migration_republish_courses(array $api_course_ids) {
+  $db = \Drupal::database();
+  
+  // Check if moderation_state column exists
+  $schema = $db->schema();
+  $has_moderation = $schema->fieldExists('node_field_data', 'moderation_state');
+  
+  // Get all unpublished/archived courses
+  $archived_courses = $db->query("
+    SELECT n.nid, nf.field_course_id_value 
+    FROM {node} n
+    INNER JOIN {node_field_data} nfd ON n.nid = nfd.nid
+    INNER JOIN {node__field_course_id} nf ON n.nid = nf.entity_id
+    WHERE n.type = 'course' 
+    AND nfd.status = 0
+  ")->fetchAll();
+  
+  $republished = 0;
+  
+  foreach ($archived_courses as $course) {
+    if (in_array($course->field_course_id_value, $api_course_ids)) {
+      // This archived course is in the API - republish it!
+      $node = Node::load($course->nid);
+      if ($node) {
+        $node->setPublished(TRUE);
+        
+        // Only set moderation_state if the field exists
+        if ($has_moderation && $node->hasField('moderation_state')) {
+          $node->set('moderation_state', 'published');
+        }
+        
+        $node->save();
+        $republished++;
+        
+        \Drupal::logger('jibc_api_migration')->notice('Republished course @id - back in API', [
+          '@id' => $course->field_course_id_value
+        ]);
+      }
+    }
+  }
+  
+  return $republished;
+}
+
+/**
+ * Unpublish courses that don't exist in the API
+ * 
+ * @param array $api_course_ids
+ *   Array of course IDs from the API
+ * 
+ * @return int
+ *   Number of courses unpublished
+ */
+function jibc_api_migration_unpublish_missing(array $api_course_ids) {
+  $db = \Drupal::database();
+  
+  // Check if moderation_state column exists
+  $schema = $db->schema();
+  $has_moderation = $schema->fieldExists('node_field_data', 'moderation_state');
+  
+  // Get all published courses
+  $published_courses = $db->query("
+    SELECT n.nid, nf.field_course_id_value 
+    FROM {node} n
+    INNER JOIN {node_field_data} nfd ON n.nid = nfd.nid
+    INNER JOIN {node__field_course_id} nf ON n.nid = nf.entity_id
+    WHERE n.type = 'course' 
+    AND nfd.status = 1
+  ")->fetchAll();
+  
+  $unpublished = 0;
+  
+  foreach ($published_courses as $course) {
+    if (!in_array($course->field_course_id_value, $api_course_ids)) {
+      // This course is NOT in the API - unpublish it
+      $node = Node::load($course->nid);
+      if ($node) {
+        $node->setPublished(FALSE);
+        // Only set moderation_state if the field exists
+        if ($has_moderation && $node->hasField('moderation_state')) {
+          $node->set('moderation_state', 'archived');
+        }
+        $node->save();
+        $unpublished++;
+        
+        \Drupal::logger('jibc_api_migration')->notice('Unpublished course @id - not in API', [
+          '@id' => $course->field_course_id_value
+        ]);
+      }
+      
+      // Safety limit to prevent mass unpublishing
+      if ($unpublished >= 50) {
+        \Drupal::logger('jibc_api_migration')->warning('Reached safety limit of 50 unpublished courses');
+        break;
+      }
+    }
+  }
+  
+  return $unpublished;
+}
+
+/**
+ * Send notification email about the sync results
+ * 
+ * @param int $republished
+ *   Number of courses republished
+ * @param int $unpublished
+ *   Number of courses unpublished
+ */
+function jibc_api_migration_send_notification($republished, $unpublished) {
+  // Only send email if something changed
+  if ($republished == 0 && $unpublished == 0) {
+    return;
+  }
+  
+  $config = \Drupal::config('jibc_api_migration.settings');
+  $recipients = $config->get('jibc_api_migration_email_recipients');
+  
+  // Check if we have valid recipients
+  if (empty($recipients) || $recipients == 'admin@example.com') {
+    \Drupal::logger('jibc_api_migration')->warning('No valid email recipients configured');
+    return;
+  }
+  
+  $mailManager = \Drupal::service('plugin.manager.mail');
+  $module = 'jibc_api_migration';
+  $key = 'cron_report';
+  $to = $recipients;
+  
+  $params['message'] = t('Course sync completed. @republished courses republished (back in API), @unpublished courses unpublished (removed from API).', [
+    '@republished' => $republished,
+    '@unpublished' => $unpublished,
+  ]);
+  
+  $langcode = \Drupal::currentUser()->getPreferredLangcode();
+  $send = TRUE;
+  
+  // Send the email
+  $result = $mailManager->mail($module, $key, $to, $langcode, $params, NULL, $send);
+  
+  if ($result['result'] != TRUE) {
+    \Drupal::logger('jibc_api_migration')->error('Failed to send notification email to @email', [
+      '@email' => $to,
+    ]);
+  }
+}
+
+/**
+ * Implements hook_mail().
+ */
+function jibc_api_migration_mail($key, &$message, $params) {
+  switch ($key) {
+    case 'cron_report':
+    case 'user':
+      $message['subject'] = t('JIBC Course Sync Report');
+      $message['body'][] = $params['message'];
+      break;
+  }
+}
